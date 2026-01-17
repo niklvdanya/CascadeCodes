@@ -1,4 +1,5 @@
 use std::{fmt, error::Error};
+use std::convert::TryInto;
 
 #[derive(Debug, Clone)]
 pub enum CodeError {
@@ -29,6 +30,7 @@ impl GaloisField {
     pub fn new(m: usize) -> CodeResult<Self> {
         let poly = match m {
             4 => 0b10011,
+            5 => 0b100101,
             8 => 0b100011101,
             _ => return Err(CodeError::InvalidParams(format!("m={} not supported", m))),
         };
@@ -70,15 +72,6 @@ impl GaloisField {
         if la < 0 || lb < 0 { return 0; }
         let idx = (la - lb + (self.size - 1) as i32) as usize % (self.size - 1);
         self.exp_table[idx]
-    }
-
-    pub fn pow(&self, a: u32, n: i32) -> u32 {
-        if a == 0 || a as usize >= self.size { return 0; }
-        let la = self.log_table[a as usize];
-        if la < 0 { return 0; }
-        let m = (self.size - 1) as i64;
-        let e = ((la as i64 * n as i64) % m + m) as usize % (self.size - 1);
-        self.exp_table[e]
     }
 
     pub fn exp(&self, i: usize) -> u32 { self.exp_table[i % (self.size - 1)] }
@@ -139,36 +132,35 @@ impl HammingCode {
         Ok(HammingCode { r, nn: n, kk: k })
     }
 
-    pub fn from_r(r: usize) -> CodeResult<Self> {
-        if r < 2 {
-            return Err(CodeError::InvalidParams("r must be >= 2".into()));
-        }
-        Self::new((1 << r) - 1, (1 << r) - 1 - r)
-    }
-
     pub fn hamming_7_4() -> CodeResult<Self> { Self::new(7, 4) }
     pub fn hamming_15_11() -> CodeResult<Self> { Self::new(15, 11) }
     pub fn hamming_31_26() -> CodeResult<Self> { Self::new(31, 26) }
-    pub fn hamming_63_57() -> CodeResult<Self> { Self::new(63, 57) }
-    pub fn hamming_127_120() -> CodeResult<Self> { Self::new(127, 120) }
-    pub fn hamming_255_247() -> CodeResult<Self> { Self::new(255, 247) }
 }
 
 impl BlockCode for HammingCode {
-    fn n(&self) -> usize { self.nn }
-    fn k(&self) -> usize { self.kk }
+    fn n(&self) -> usize { (self.nn + 7) / 8 }
+    fn k(&self) -> usize { (self.kk + 7) / 8 }
     fn d(&self) -> usize { 3 }
 
     fn encode_block(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        if data.len() != self.kk {
-            return Err(CodeError::BadBlockSize(data.len(), self.kk));
+        let expected_bytes = (self.kk + 7) / 8;
+        if data.len() != expected_bytes {
+            return Err(CodeError::BadBlockSize(data.len(), expected_bytes));
         }
-        let mut cw = vec![0u8; self.nn];
-        let mut di = 0;
+        let mut input_bits = Vec::with_capacity(self.kk);
+        for &byte in data {
+            for bit_pos in 0..8 {
+                if input_bits.len() < self.kk {
+                    input_bits.push((byte >> bit_pos) & 1);
+                }
+            }
+        }
+        let mut cw_bits = vec![0u8; self.nn];
+        let mut data_idx = 0;
         for i in 1..=self.nn {
             if i.count_ones() != 1 {
-                cw[i - 1] = data[di];
-                di += 1;
+                cw_bits[i - 1] = input_bits[data_idx];
+                data_idx += 1;
             }
         }
         for p in 0..self.r {
@@ -176,26 +168,41 @@ impl BlockCode for HammingCode {
             let mut parity = 0u8;
             for i in 1..=self.nn {
                 if i & pos != 0 {
-                    parity ^= cw[i - 1];
+                    parity ^= cw_bits[i - 1];
                 }
             }
-            cw[pos - 1] = parity;
+            cw_bits[pos - 1] = parity;
         }
-        Ok(cw)
+        let output_bytes = (self.nn + 7) / 8;
+        let mut output = vec![0u8; output_bytes];
+        for (i, &bit) in cw_bits.iter().enumerate() {
+            if bit != 0 {
+                output[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(output)
     }
 
     fn decode_block(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        if data.len() != self.nn {
-            return Err(CodeError::BadBlockSize(data.len(), self.nn));
+        let expected_bytes = (self.nn + 7) / 8;
+        if data.len() != expected_bytes {
+            return Err(CodeError::BadBlockSize(data.len(), expected_bytes));
         }
-        let mut cw = data.to_vec();
+        let mut cw_bits = Vec::with_capacity(self.nn);
+        for &byte in data {
+            for bit_pos in 0..8 {
+                if cw_bits.len() < self.nn {
+                    cw_bits.push((byte >> bit_pos) & 1);
+                }
+            }
+        }
         let mut syndrome = 0usize;
         for p in 0..self.r {
             let pos = 1 << p;
             let mut parity = 0u8;
             for i in 1..=self.nn {
                 if i & pos != 0 {
-                    parity ^= cw[i - 1];
+                    parity ^= cw_bits[i - 1];
                 }
             }
             if parity != 0 {
@@ -203,9 +210,22 @@ impl BlockCode for HammingCode {
             }
         }
         if syndrome > 0 && syndrome <= self.nn {
-            cw[syndrome - 1] ^= 1;
+            cw_bits[syndrome - 1] ^= 1;
         }
-        Ok((1..=self.nn).filter(|i| i.count_ones() != 1).map(|i| cw[i - 1]).collect())
+        let mut output_bits = Vec::new();
+        for i in 1..=self.nn {
+            if i.count_ones() != 1 {
+                output_bits.push(cw_bits[i - 1]);
+            }
+        }
+        let output_bytes = (self.kk + 7) / 8;
+        let mut output = vec![0u8; output_bytes];
+        for (i, &bit) in output_bits.iter().enumerate() {
+            if bit != 0 {
+                output[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -248,7 +268,6 @@ impl ReedSolomonCode {
         let mut l = 0usize;
         let mut m = 1usize;
         let mut bb = 1u32;
-
         for n in 0..n2t {
             let mut d = s[n];
             for i in 1..=l {
@@ -305,32 +324,27 @@ impl ReedSolomonCode {
                 omega[i] = self.gf.add(omega[i], self.gf.mul(sigma[j], s[i - j]));
             }
         }
-
         let mut sigma_d = vec![0u32; sigma.len()];
         for i in (1..sigma.len()).step_by(2) {
             sigma_d[i - 1] = sigma[i];
         }
-
         pos.iter().map(|&p| {
             let x_p = self.gf.exp(p);
             let x_p_inv = if p == 0 { 1 } else {
                 self.gf.exp((self.gf.size - 1 - p % (self.gf.size - 1)) % (self.gf.size - 1))
             };
-
             let mut ov = 0u32;
             let mut xpow = 1u32;
             for &c in omega.iter() {
                 ov = self.gf.add(ov, self.gf.mul(c, xpow));
                 xpow = self.gf.mul(xpow, x_p_inv);
             }
-
             let mut sv = 0u32;
             xpow = 1u32;
             for &c in sigma_d.iter() {
                 sv = self.gf.add(sv, self.gf.mul(c, xpow));
                 xpow = self.gf.mul(xpow, x_p_inv);
             }
-
             if sv != 0 { self.gf.mul(x_p, self.gf.div(ov, sv)) } else { 0 }
         }).collect()
     }
@@ -441,44 +455,143 @@ impl Interleaver for BlockInterleaver {
     }
 }
 
+pub trait LevelConverter: Send + Sync {
+    fn convert_down(&self, data: &[u8]) -> Vec<u8>;
+    fn convert_up(&self, data: &[u8]) -> Vec<u8>;
+    fn info(&self) -> String { "converter".to_string() }
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentityConverter;
+
+impl LevelConverter for IdentityConverter {
+    fn convert_down(&self, data: &[u8]) -> Vec<u8> { data.to_vec() }
+    fn convert_up(&self, data: &[u8]) -> Vec<u8> { data.to_vec() }
+    fn info(&self) -> String { "identity".to_string() }
+}
+
+#[derive(Debug, Clone)]
+pub struct BitConverter {
+    bits_per_block: usize,
+}
+
+impl BitConverter {
+    pub fn new(bits_per_block: usize) -> Self {
+        BitConverter { bits_per_block }
+    }
+    
+    pub fn for_hamming_7_4() -> Self { BitConverter { bits_per_block: 4 } }
+    pub fn for_hamming_15_11() -> Self { BitConverter { bits_per_block: 11 } }
+}
+
+impl LevelConverter for BitConverter {
+    fn convert_down(&self, data: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        for &byte in data {
+            for i in 0..8 {
+                bits.push((byte >> i) & 1);
+            }
+        }
+        while bits.len() % self.bits_per_block != 0 {
+            bits.push(0);
+        }
+        let bytes_per_block = (self.bits_per_block + 7) / 8;
+        let mut result = Vec::new();
+        for chunk in bits.chunks(self.bits_per_block) {
+            let mut block = vec![0u8; bytes_per_block];
+            for (i, &bit) in chunk.iter().enumerate() {
+                if bit != 0 {
+                    block[i / 8] |= 1 << (i % 8);
+                }
+            }
+            result.extend(block);
+        }
+        result
+    }
+    
+    fn convert_up(&self, data: &[u8]) -> Vec<u8> {
+        let bytes_per_block = (self.bits_per_block + 7) / 8;
+        let mut bits = Vec::new();
+        for chunk in data.chunks(bytes_per_block) {
+            let mut count = 0;
+            for &byte in chunk {
+                for i in 0..8 {
+                    if count < self.bits_per_block {
+                        bits.push((byte >> i) & 1);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for chunk in bits.chunks(8) {
+            let mut byte = 0u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                if bit != 0 {
+                    byte |= 1 << i;
+                }
+            }
+            result.push(byte);
+        }
+        result
+    }
+    
+    fn info(&self) -> String {
+        format!("bit converter ({} bits/block)", self.bits_per_block)
+    }
+}
+
 pub struct CascadeCode<O: BlockCode, I: BlockCode> {
     pub outer: O,
     pub inner: I,
     interleaver: Option<Box<dyn Interleaver>>,
+    converter: Box<dyn LevelConverter>,
 }
 
 impl<O: BlockCode, I: BlockCode> CascadeCode<O, I> {
     pub fn new(outer: O, inner: I) -> Self {
-        CascadeCode { outer, inner, interleaver: None }
+        CascadeCode { outer, inner, interleaver: None, converter: Box::new(IdentityConverter) }
     }
-
+    
     pub fn with_interleaver(outer: O, inner: I, il: Box<dyn Interleaver>) -> Self {
-        CascadeCode { outer, inner, interleaver: Some(il) }
+        CascadeCode { outer, inner, interleaver: Some(il), converter: Box::new(IdentityConverter) }
     }
-
-    pub fn rate(&self) -> f64 {
-        self.outer.rate() * self.inner.rate()
+    
+    pub fn with_converter(outer: O, inner: I, conv: Box<dyn LevelConverter>) -> Self {
+        CascadeCode { outer, inner, interleaver: None, converter: conv }
     }
+    
+    pub fn with_all(outer: O, inner: I, il: Box<dyn Interleaver>, conv: Box<dyn LevelConverter>) -> Self {
+        CascadeCode { outer, inner, interleaver: Some(il), converter: conv }
+    }
+    
+    pub fn rate(&self) -> f64 { self.outer.rate() * self.inner.rate() }
+    
+    pub fn converter_info(&self) -> String { self.converter.info() }
 
     pub fn encode(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        let enc = self.outer.encode(data)?;
-        let il = self.interleaver.as_ref().map_or(enc.clone(), |i| i.interleave(&enc));
-        self.inner.encode(&il)
+        let outer_enc = self.outer.encode(data)?;
+        let interleaved = self.interleaver.as_ref()
+            .map_or(outer_enc.clone(), |il| il.interleave(&outer_enc));
+        let converted = self.converter.convert_down(&interleaved);
+        let inner_enc = self.inner.encode(&converted)?;
+        Ok(inner_enc)
     }
 
     pub fn decode(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        let dec = self.inner.decode(data)?;
-        let dil = self.interleaver.as_ref().map_or(dec.clone(), |i| i.deinterleave(&dec));
-        self.outer.decode(&dil)
+        let inner_dec = self.inner.decode(data)?;
+        let converted = self.converter.convert_up(&inner_dec);
+        let deinterleaved = self.interleaver.as_ref()
+            .map_or(converted.clone(), |il| il.deinterleave(&converted));
+        let outer_dec = self.outer.decode(&deinterleaved)?;
+        Ok(outer_dec)
     }
 }
 
 pub struct DynBlockCode(Box<dyn BlockCode>);
 
 impl DynBlockCode {
-    pub fn new<C: BlockCode + 'static>(code: C) -> Self {
-        DynBlockCode(Box::new(code))
-    }
+    pub fn new<C: BlockCode + 'static>(code: C) -> Self { DynBlockCode(Box::new(code)) }
 }
 
 impl BlockCode for DynBlockCode {
@@ -507,11 +620,7 @@ impl MultiLevelCascade {
         self
     }
 
-    pub fn add_level_with_interleaver<C: BlockCode + 'static>(
-        mut self,
-        code: C,
-        il: Box<dyn Interleaver>,
-    ) -> Self {
+    pub fn add_level_with_interleaver<C: BlockCode + 'static>(mut self, code: C, il: Box<dyn Interleaver>) -> Self {
         self.codes.push(DynBlockCode::new(code));
         self.interleavers.push(Some(il));
         self
@@ -519,30 +628,69 @@ impl MultiLevelCascade {
 
     pub fn levels(&self) -> usize { self.codes.len() }
 
-    pub fn rate(&self) -> f64 {
-        self.codes.iter().map(|c| c.rate()).product()
-    }
+    pub fn rate(&self) -> f64 { self.codes.iter().map(|c| c.rate()).product() }
 
     pub fn encode(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        let mut buf = data.to_vec();
-        for (i, code) in self.codes.iter().enumerate() {
-            buf = code.encode(&buf)?;
-            if let Some(il) = &self.interleavers[i] {
-                buf = il.interleave(&buf);
-            }
+        if self.codes.is_empty() {
+            return Ok(data.to_vec());
         }
-        Ok(buf)
+        let mut current = data.to_vec();
+        let mut lengths: Vec<u32> = Vec::new();
+        for (i, code) in self.codes.iter().enumerate() {
+            lengths.push(current.len() as u32);
+            let mut encoded = Vec::new();
+            for chunk in current.chunks(code.k()) {
+                let mut blk = chunk.to_vec();
+                blk.resize(code.k(), 0);
+                encoded.extend(code.encode_block(&blk)?);
+            }
+            if let Some(il) = &self.interleavers[i] {
+                encoded = il.interleave(&encoded);
+            }
+            current = encoded;
+        }
+        let mut result = Vec::new();
+        result.extend((self.codes.len() as u32).to_be_bytes());
+        for len in &lengths {
+            result.extend(len.to_be_bytes());
+        }
+        result.extend(current);
+        Ok(result)
     }
 
     pub fn decode(&self, data: &[u8]) -> CodeResult<Vec<u8>> {
-        let mut buf = data.to_vec();
+        if self.codes.is_empty() {
+            return Ok(data.to_vec());
+        }
+        let header_size = 4 + 4 * self.codes.len();
+        if data.len() < header_size {
+            return Err(CodeError::DecodingErr(format!("data too short: {} < {}", data.len(), header_size)));
+        }
+        let num_levels = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+        if num_levels != self.codes.len() {
+            return Err(CodeError::DecodingErr(format!("level mismatch: expected {}, got {}", self.codes.len(), num_levels)));
+        }
+        let mut lengths = Vec::new();
+        for i in 0..num_levels {
+            let offset = 4 + i * 4;
+            let len = u32::from_be_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            lengths.push(len);
+        }
+        let mut current = data[header_size..].to_vec();
         for (i, code) in self.codes.iter().enumerate().rev() {
             if let Some(il) = &self.interleavers[i] {
-                buf = il.deinterleave(&buf);
+                current = il.deinterleave(&current);
             }
-            buf = code.decode(&buf)?;
+            let mut decoded = Vec::new();
+            for chunk in current.chunks(code.n()) {
+                let mut blk = chunk.to_vec();
+                blk.resize(code.n(), 0);
+                decoded.extend(code.decode_block(&blk)?);
+            }
+            decoded.truncate(lengths[i]);
+            current = decoded;
         }
-        Ok(buf)
+        Ok(current)
     }
 }
 
@@ -551,9 +699,9 @@ impl Default for MultiLevelCascade {
 }
 
 pub mod prelude {
-    pub use crate::{
+    pub use super::{
         BlockCode, BlockInterleaver, CascadeCode, CodeError, CodeResult,
         DynBlockCode, GaloisField, HammingCode, Interleaver, MultiLevelCascade,
-        ReedSolomonCode,
+        ReedSolomonCode, LevelConverter, IdentityConverter, BitConverter,
     };
 }
